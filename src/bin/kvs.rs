@@ -47,7 +47,7 @@ fn main() {
     };
 
     match config {
-        Config::Get { key } => { 
+        Config::Get { key } => {
             if let Ok(Some(value)) = store.get(key) {
                 println!("{}", value);
             } else {

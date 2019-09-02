@@ -1,5 +1,5 @@
 /// An in-memory key-value store.
-/// 
+///
 /// The log is formatted as JSON due to its simplicity and
 /// easy debuggability.
 
@@ -60,7 +60,7 @@ impl KvStore {
 
     pub fn open(dir_path: impl Into<PathBuf>) -> Result<KvStore> {
         let file_path = dir_path.into().join("log_file.log");
-        
+
         let map: HashMap<String, String> = match File::open(&file_path) {
             Ok(read_log) => load(read_log)?,
             _ => HashMap::new(),
@@ -148,9 +148,9 @@ enum Command {
 fn load(log: File) -> Result<HashMap<String, String>> {
     let mut map: HashMap<String, String> = HashMap::new();
     let reader = BufReader::new(log);
-    let mut commands = Deserializer::from_reader(reader).into_iter::<Command>();
+    let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
 
-    while let Some(command) = commands.next() {
+    while let Some(command) = stream.next() {
         match command? {
             Command::Set {key, value} => {
                 map.insert(key, value);
