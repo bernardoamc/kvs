@@ -3,7 +3,9 @@
 /// The log is formatted as JSON due to its simplicity and
 /// easy debuggability.
 
+use std::io::prelude::*;
 use std::fs::{File, OpenOptions};
+
 use std::collections::HashMap;
 use std::result;
 use std::path::{PathBuf};
@@ -12,11 +14,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 
 use std::io;
-use std::io::{BufReader};
+use std::io::{BufReader, SeekFrom};
 
 #[derive(Debug)]
 pub enum KvsError {
     KeyNotFound,
+    UnexpectedCommand,
     Io(io::Error),
     Serde(serde_json::Error),
 }
@@ -35,11 +38,23 @@ impl From<serde_json::Error> for KvsError {
 
 pub type Result<T> = result::Result<T, KvsError>;
 
+#[derive(Serialize, Deserialize, Debug)]
+enum Command {
+    Set { key: String, value: String},
+    Remove { key: String }
+}
+
+#[derive(Debug)]
+pub struct CommandMetadata {
+    position: u64,
+    length: u64,
+}
+
 /// A struct representing our key-value store mechanism.
 pub struct KvStore {
     path: PathBuf,
     writer: File,
-    map: HashMap<String, String>,
+    map: HashMap<String, CommandMetadata>,
 }
 
 impl KvStore {
@@ -50,7 +65,7 @@ impl KvStore {
     ///
     /// let store = KvStore::new(path, log_file, hash_map);
     /// ```
-    pub fn new(path: PathBuf, writer: File, map: HashMap<String, String>) -> Self {
+    pub fn new(path: PathBuf, writer: File, map: HashMap<String, CommandMetadata>) -> Self {
         KvStore {
             path,
             writer,
@@ -61,7 +76,7 @@ impl KvStore {
     pub fn open(dir_path: impl Into<PathBuf>) -> Result<KvStore> {
         let file_path = dir_path.into().join("log_file.log");
 
-        let map: HashMap<String, String> = match File::open(&file_path) {
+        let map: HashMap<String, CommandMetadata> = match File::open(&file_path) {
             Ok(read_log) => load(read_log)?,
             _ => HashMap::new(),
         };
@@ -70,6 +85,7 @@ impl KvStore {
             .write(true)
             .create(true)
             .append(true)
+            .read(true)
             .open(file_path.to_owned())?;
 
         let store = KvStore::new(file_path.to_owned(), log_file, map);
@@ -91,9 +107,12 @@ impl KvStore {
     /// ```
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
         let cmd = Command::Set { key: key.to_owned(), value: value.to_owned() };
+        let pos = self.writer.seek(SeekFrom::End(0))?;
         serde_json::to_writer(&mut self.writer, &cmd)?;
+        self.writer.flush()?;
+        let new_pos = self.writer.seek(SeekFrom::End(0))?;
 
-        self.map.insert(key, value);
+        self.map.insert(key, CommandMetadata { position: pos, length: (new_pos - pos)});
         Ok(())
     }
 
@@ -111,7 +130,19 @@ impl KvStore {
     /// println!("{:?}", store.get("foo".to_owned()));
     /// ```
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        Ok(self.map.get(&key).cloned())
+        match self.map.get(&key) {
+            Some(metadata) => {
+                dbg!(metadata);
+                dbg!(read_n(&mut self.writer, metadata.position, metadata.length)?);
+
+                if let Command::Set { value, .. } = read_n(&mut self.writer, metadata.position, metadata.length)? {
+                    Ok(Some(value))
+                } else {
+                    Err(KvsError::UnexpectedCommand)
+                }
+            },
+            None => Ok(None),
+        }
     }
 
     /// Removes a `key` and its associated value from our key-value store.
@@ -139,27 +170,34 @@ impl KvStore {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-enum Command {
-    Set { key: String, value: String},
-    Remove { key: String }
-}
-
-fn load(log: File) -> Result<HashMap<String, String>> {
-    let mut map: HashMap<String, String> = HashMap::new();
-    let reader = BufReader::new(log);
+fn load(log: File) -> Result<HashMap<String, CommandMetadata>> {
+    let mut map: HashMap<String, CommandMetadata> = HashMap::new();
+    let mut reader = BufReader::new(log);
+    let mut pos = reader.seek(SeekFrom::Start(0))?;
     let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
 
     while let Some(command) = stream.next() {
+        let next_pos = stream.byte_offset() as u64;
+
         match command? {
-            Command::Set {key, value} => {
-                map.insert(key, value);
+            Command::Set {key, ..} => {
+                map.insert(key, CommandMetadata { position: pos, length: (next_pos - pos) });
             },
             Command::Remove {key} => {
                 map.remove(&key);
             }
         }
+
+        pos = next_pos;
     }
 
     Ok(map)
+}
+
+fn read_n<R: Read + Seek>(mut reader: R, position: u64, bytes_to_read: u64) -> Result<Command> {
+    reader.seek(SeekFrom::Start(position))?;
+    let mut chunk = reader.take(bytes_to_read);
+    let command = serde_json::from_reader(&mut chunk)?;
+
+    Ok(command)
 }
