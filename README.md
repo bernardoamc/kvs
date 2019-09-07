@@ -8,7 +8,7 @@ This is my first stab at writing a Rust program, do not base yourself on this co
 ### Next steps
 
 * Use BufWriter instead of a file directly
-* Extract error related logic to a proper file
+* ~~Extract error related logic to a proper file~~
 * Have proper reader and writer files instead of a single file
 * Refactor metadata logic, maybe extending BufReader itself
 * Implement compaction algorithm
