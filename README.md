@@ -7,7 +7,7 @@ This is my first stab at writing a Rust program, do not base yourself on this co
 
 ### Next steps
 
-* Consider using BTreeMap instead of HashMap
+* ~~Consider using BTreeMap instead of HashMap~~
 * Should we use multiple log files with a bounded size?
 * Use BufWriter instead of a file directly
 * ~~Extract error related logic to a proper file~~

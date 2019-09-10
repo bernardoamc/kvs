@@ -3,7 +3,7 @@ use crate::{KvsError, Result};
 use std::io::prelude::*;
 use std::io::{BufReader, SeekFrom};
 use std::fs::{File, OpenOptions};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ pub struct CommandMetadata {
 pub struct KvStore {
     path: PathBuf,
     writer: File,
-    map: HashMap<String, CommandMetadata>,
+    map: BTreeMap<String, CommandMetadata>,
 }
 
 impl KvStore {
@@ -36,7 +36,7 @@ impl KvStore {
     ///
     /// let store = KvStore::new(path, log_file, hash_map);
     /// ```
-    pub fn new(path: PathBuf, writer: File, map: HashMap<String, CommandMetadata>) -> Self {
+    pub fn new(path: PathBuf, writer: File, map: BTreeMap<String, CommandMetadata>) -> Self {
         KvStore {
             path,
             writer,
@@ -55,9 +55,9 @@ impl KvStore {
     pub fn open(dir_path: impl Into<PathBuf>) -> Result<KvStore> {
         let file_path = dir_path.into().join("log_file.log");
 
-        let map: HashMap<String, CommandMetadata> = match File::open(&file_path) {
+        let map: BTreeMap<String, CommandMetadata> = match File::open(&file_path) {
             Ok(read_log) => load(read_log)?,
-            _ => HashMap::new(),
+            _ => BTreeMap::new(),
         };
 
         let log_file = OpenOptions::new()
@@ -149,8 +149,8 @@ impl KvStore {
     }
 }
 
-fn load(log: File) -> Result<HashMap<String, CommandMetadata>> {
-    let mut map: HashMap<String, CommandMetadata> = HashMap::new();
+fn load(log: File) -> Result<BTreeMap<String, CommandMetadata>> {
+    let mut map: BTreeMap<String, CommandMetadata> = BTreeMap::new();
     let mut reader = BufReader::new(log);
     let mut pos = reader.seek(SeekFrom::Start(0))?;
     let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
