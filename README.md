@@ -1,5 +1,15 @@
 # kvs
-In memory key value store.
+Log structured key-value store.
+
+*Reading*
+
+During startup the data is read from every log file and stored in a BTreeMap in which keys points directly to locations on disk where the data lives.
+Read operations uses at most one disk seek, sometimes none due to file system caching.
+
+*Writing*
+
+Data is written to append only files and requires two seek operations to the end of the file.
+This will be refactored in order to require a single seek operation.
 
 ## Disclaimer
 
@@ -13,4 +23,5 @@ This is my first stab at writing a Rust program, do not base yourself on this co
 * ~~Have proper reader and writer files instead of a single file~~
 * ~~Refactor metadata logic, maybe extending BufReader itself~~
 * Should we use multiple log files with a bounded size?
+* Refactor set operation to require a single seek
 * Implement compaction algorithm
