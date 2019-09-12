@@ -53,8 +53,10 @@ impl KvStore {
         }
     }
 
-    /// Opens the log file and reconstructs the key/value store in memory.
-    /// Keys are stored in a HashMap pointing to positions in the log file.
+    /// Opens each log file and reconstructs the key/value store in memory.
+    /// Keys are stored in a BTreeMap pointing to positions in their respective log file.
+    ///
+    /// A new log file is always generated in this step to serve as the writer file.
     ///
     /// ```
     /// use kvs::KvStore;
@@ -83,7 +85,8 @@ impl KvStore {
         Ok(store)
     }
 
-    /// Inserts a String `value` associated with a String `key`.
+    /// Serializes a Command::Set and appends it to the writer log file.
+    /// Once this operation is sucessful inserts the value and metadata to our BTreeMap.
     ///
     /// # Arguments
     ///
@@ -107,7 +110,8 @@ impl KvStore {
         Ok(())
     }
 
-    /// Gets a String `value` associated with a String `key` when that `key` exists.
+    /// Fetches the serialized command associated with the `key` from a log file,
+    /// unserializes it and returns the associated value.
     ///
     /// # Arguments
     ///
@@ -121,23 +125,24 @@ impl KvStore {
     /// println!("{:?}", store.get("foo".to_owned()));
     /// ```
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        match self.map.get(&key) {
-            Some(metadata) => {
-                if let Some(mut reader) = self.readers.get_mut(&metadata.file_index) {
-                    if let Command::Set { value, .. } = read_n(&mut reader, metadata)? {
-                        Ok(Some(value))
-                    } else {
-                        Err(KvsError::UnexpectedCommand)
-                    }
-                } else {
-                    return Err(KvsError::UnexpectedCommand);
-                }
-            },
-            None => Ok(None),
+        let metadata = match self.map.get(&key) {
+            Some(metadata) => metadata,
+            None => return Ok(None),
+        };
+
+        let mut reader = self.readers
+            .get_mut(&metadata.file_index)
+            .ok_or(KvsError::UnexpectedCommand)?;
+
+        if let Command::Set { value, .. } = read_command(&mut reader, metadata)? {
+            Ok(Some(value))
+        } else {
+            Err(KvsError::UnexpectedCommand)
         }
     }
 
-    /// Removes a `key` and its associated value from our key-value store.
+    /// Removes a `key` and its associated metadata from our BTreeMap and
+    /// writes a serialized Command::Remove to our writer log file.
     ///
     /// # Arguments
     ///
@@ -151,14 +156,11 @@ impl KvStore {
     /// store.remove("foo".to_owned());
     /// ```
     pub fn remove(&mut self, key: String) -> Result<()> {
-        match self.map.remove(&key) {
-            Some(_) => {
-                let cmd = Command::Remove { key: key.to_owned() };
-                serde_json::to_writer(&mut self.writer, &cmd)?;
-                Ok(())
-            },
-            None => Err(KvsError::KeyNotFound)
-        }
+        self.map.remove(&key).ok_or(KvsError::KeyNotFound)?;
+
+        let cmd = Command::Remove { key: key.to_owned() };
+        serde_json::to_writer(&mut self.writer, &cmd)?;
+        Ok(())
     }
 }
 
@@ -222,7 +224,7 @@ fn load(file_index: u64, reader: &mut BufReader<File>, map: &mut BTreeMap<String
     Ok(())
 }
 
-fn read_n<R: Read + Seek>(mut reader: R, metadata: &CommandMetadata) -> Result<Command> {
+fn read_command<R: Read + Seek>(mut reader: R, metadata: &CommandMetadata) -> Result<Command> {
     reader.seek(SeekFrom::Start(metadata.position))?;
     let mut chunk = reader.take(metadata.length);
     let command = serde_json::from_reader(&mut chunk)?;
