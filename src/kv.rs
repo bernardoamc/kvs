@@ -10,6 +10,8 @@ use std::ffi::OsStr;
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 
+const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
+
 #[derive(Serialize, Deserialize, Debug)]
 enum Command {
     Set { key: String, value: String},
@@ -25,10 +27,12 @@ pub struct CommandMetadata {
 
 /// A struct representing our key-value store mechanism.
 pub struct KvStore {
+    path: PathBuf,
     readers: HashMap<u64, BufReader<File>>,
     writer: BufWriter<File>,
     map: BTreeMap<String, CommandMetadata>,
     current_index: u64,
+    umcompacted_bytes: u64,
 }
 
 impl KvStore {
@@ -40,16 +44,20 @@ impl KvStore {
     /// let store = KvStore::new(path, log_file, hash_map);
     /// ```
     pub fn new(
+        path: PathBuf,
         readers: HashMap<u64, BufReader<File>>,
         writer: BufWriter<File>,
         map: BTreeMap<String, CommandMetadata>,
-        current_index: u64
+        current_index: u64,
+        umcompacted_bytes: u64,
     ) -> Self {
         KvStore {
+            path,
             readers,
             writer,
             map,
             current_index,
+            umcompacted_bytes,
         }
     }
 
@@ -69,7 +77,7 @@ impl KvStore {
         let mut map: BTreeMap<String, CommandMetadata> = BTreeMap::new();
 
         let file_indexes = fetch_file_indexes(dir_path.to_owned())?;
-        load_files(dir_path.to_owned(), &file_indexes, &mut readers, &mut map)?;
+        let total_umcompacted_bytes = load_files(dir_path.to_owned(), &file_indexes, &mut readers, &mut map)?;
 
         let new_index = file_indexes.last().unwrap_or(&0) + 1;
         let writer_path = dir_path.to_owned().join(format!("{}.log", new_index));
@@ -81,7 +89,7 @@ impl KvStore {
             .open(&writer_path)?;
 
         readers.insert(new_index, BufReader::new(File::open(&writer_path)?));
-        let store = KvStore::new(readers, BufWriter::new(writer), map, new_index);
+        let store = KvStore::new(dir_path, readers, BufWriter::new(writer), map, new_index, total_umcompacted_bytes);
         Ok(store)
     }
 
@@ -162,6 +170,47 @@ impl KvStore {
         serde_json::to_writer(&mut self.writer, &cmd)?;
         Ok(())
     }
+
+    /// Compacts log files once the total amount of umcompacted bytes surpasses the
+    /// COMPACTION_THRESHOLD.
+    ///
+    /// ```
+    /// use kvs::KvStore;
+    ///
+    /// let mut store = KvStore::open(dir_path);;
+    /// store.compact();
+    /// ```
+    pub fn compact(&mut self) -> Result<()> {
+        if self.umcompacted_bytes <= COMPACTION_THRESHOLD {
+            return Ok(())
+        }
+
+        let mut writer_pos: u64 = 0;
+
+        for cmd_metadata in self.map.values_mut() {
+            let reader = self.readers
+                .get_mut(&cmd_metadata.file_index)
+                .ok_or(KvsError::UnexpectedCommand)?;
+
+            reader.seek(SeekFrom::Start(cmd_metadata.position))?;
+            let mut chunk = reader.take(cmd_metadata.length);
+            let len = std::io::copy(&mut chunk, &mut self.writer)?;
+            *cmd_metadata = CommandMetadata { file_index: self.current_index, position: writer_pos, length: len };
+            writer_pos += len;
+        }
+
+        self.writer.flush()?;
+        let stale_log_indexes: Vec<u64> = self.readers.keys().filter(|key| **key < self.current_index).cloned().collect();
+
+        for stale_log_index in stale_log_indexes {
+            self.readers.remove(&stale_log_index);
+            let stale_path = self.path.to_owned().join(format!("{}.log", stale_log_index));
+            std::fs::remove_file(stale_path)?;
+        }
+
+        self.umcompacted_bytes = 0;
+        Ok(())
+    }
 }
 
 fn fetch_file_indexes(dir_path: impl Into<PathBuf>) -> Result<Vec<u64>> {
@@ -187,41 +236,53 @@ fn load_files(
     file_indexes: &Vec<u64>,
     readers: &mut HashMap<u64, BufReader<File>>,
     map: &mut BTreeMap<String, CommandMetadata>
-) -> Result<()> {
+) -> Result<u64> {
     let dir_path = dir_path.into();
+    let mut total_umcompacted_bytes: u64 = 0;
 
     for file_index in file_indexes {
         let file_path = dir_path.join(format!("{}.log", file_index));
         let reader = OpenOptions::new().read(true).open(file_path)?;
         let mut buffer = BufReader::new(reader);
 
-        load(file_index.to_owned(), &mut buffer, map)?;
+        total_umcompacted_bytes += load_file(file_index.to_owned(), &mut buffer, map)?;
         readers.insert(file_index.to_owned(), buffer);
     }
 
-    Ok(())
+    Ok(total_umcompacted_bytes)
 }
 
-fn load(file_index: u64, reader: &mut BufReader<File>, map: &mut BTreeMap<String, CommandMetadata>) -> Result<()> {
+fn load_file(file_index: u64, reader: &mut BufReader<File>, map: &mut BTreeMap<String, CommandMetadata>) -> Result<u64> {
     let mut pos = reader.seek(SeekFrom::Start(0))?;
     let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
+    let mut umcompacted_bytes: u64 = 0;
 
-    while let Some(command) = stream.next() {
+    while let Some(command_result) = stream.next() {
         let next_pos = stream.byte_offset() as u64;
+        let command = command_result?;
 
-        match command? {
-            Command::Set {key, ..} => {
-                map.insert(key, CommandMetadata { file_index: file_index, position: pos, length: (next_pos - pos) });
-            },
-            Command::Remove {key} => {
-                map.remove(&key);
-            }
-        }
-
+        umcompacted_bytes += load_command(map, command, file_index, pos, next_pos);
         pos = next_pos;
     }
 
-    Ok(())
+    Ok(umcompacted_bytes)
+}
+
+/// Load command into our BTreeMap and return the length of superseeded commands
+fn load_command(map: &mut BTreeMap<String, CommandMetadata>, command: Command, file_index: u64, pos: u64, next_pos: u64) -> u64 {
+    let old_metadata = match command {
+        Command::Set {key, ..} => {
+            map.insert(key, CommandMetadata { file_index: file_index, position: pos, length: (next_pos - pos) })
+        },
+        Command::Remove {key} => {
+            map.remove(&key)
+        }
+    };
+
+    match old_metadata {
+        Some(metadata) => metadata.length,
+        None => 0,
+    }
 }
 
 fn read_command<R: Read + Seek>(mut reader: R, metadata: &CommandMetadata) -> Result<Command> {

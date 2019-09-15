@@ -22,6 +22,7 @@ This is my first stab at writing a Rust program, do not base yourself on this co
 * ~~Extract error related logic to a proper file~~
 * ~~Have proper reader and writer files instead of a single file~~
 * ~~Refactor metadata logic, maybe extending BufReader itself~~
+* ~~Implement compaction algorithm~~
+* Trigger compaction during set operation
 * Should we use multiple log files with a bounded size?
 * Refactor set operation to require a single seek
-* Implement compaction algorithm

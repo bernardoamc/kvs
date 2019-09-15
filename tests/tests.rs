@@ -92,10 +92,8 @@ fn cli_get_stored() -> Result<()> {
 // `kvs rm <KEY>` should print nothing and exit with zero.
 #[test]
 fn cli_rm_stored() -> Result<()> {
-    // let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let temp_dir = std::env::current_dir().expect("unable to create temporary working directory");
-    //let mut store = KvStore::open(temp_dir.path())?;
-    let mut store = KvStore::open(temp_dir.to_owned())?;
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let mut store = KvStore::open(temp_dir.path())?;
     store.set("key1".to_owned(), "value1".to_owned())?;
     drop(store);
 
