@@ -89,7 +89,9 @@ impl KvStore {
             .open(&writer_path)?;
 
         readers.insert(new_index, BufReader::new(File::open(&writer_path)?));
-        let store = KvStore::new(dir_path, readers, BufWriter::new(writer), map, new_index, total_umcompacted_bytes);
+        let mut store = KvStore::new(dir_path, readers, BufWriter::new(writer), map, new_index, total_umcompacted_bytes);
+        store.compact()?;
+
         Ok(store)
     }
 
@@ -114,7 +116,15 @@ impl KvStore {
         self.writer.flush()?;
         let new_pos = self.writer.seek(SeekFrom::End(0))?;
 
-        self.map.insert(key, CommandMetadata { file_index: self.current_index, position: pos, length: (new_pos - pos)});
+        let old_metadata = self.map.insert(key, CommandMetadata { file_index: self.current_index, position: pos, length: (new_pos - pos)});
+
+        self.umcompacted_bytes += match old_metadata {
+            Some(metadata) => metadata.length,
+            None => 0,
+        };
+
+        self.compact()?;
+
         Ok(())
     }
 
@@ -180,12 +190,24 @@ impl KvStore {
     /// let mut store = KvStore::open(dir_path);;
     /// store.compact();
     /// ```
-    pub fn compact(&mut self) -> Result<()> {
+    fn compact(&mut self) -> Result<()> {
         if self.umcompacted_bytes <= COMPACTION_THRESHOLD {
             return Ok(())
         }
 
-        let mut writer_pos: u64 = 0;
+        let compaction_index = self.current_index + 1;
+        self.current_index += 2;
+
+        let compaction_path = self.path.to_owned().join(format!("{}.log", compaction_index));
+        let mut compaction_writer = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(&compaction_path)?;
+
+        self.readers.insert(compaction_index, BufReader::new(File::open(&compaction_path)?));
+
+        let mut compaction_writer_pos: u64 = 0;
 
         for cmd_metadata in self.map.values_mut() {
             let reader = self.readers
@@ -194,13 +216,13 @@ impl KvStore {
 
             reader.seek(SeekFrom::Start(cmd_metadata.position))?;
             let mut chunk = reader.take(cmd_metadata.length);
-            let len = std::io::copy(&mut chunk, &mut self.writer)?;
-            *cmd_metadata = CommandMetadata { file_index: self.current_index, position: writer_pos, length: len };
-            writer_pos += len;
+            let len = std::io::copy(&mut chunk, &mut compaction_writer)?;
+            *cmd_metadata = CommandMetadata { file_index: self.current_index, position: compaction_writer_pos, length: len };
+            compaction_writer_pos += len;
         }
 
-        self.writer.flush()?;
-        let stale_log_indexes: Vec<u64> = self.readers.keys().filter(|key| **key < self.current_index).cloned().collect();
+        compaction_writer.flush()?;
+        let stale_log_indexes: Vec<u64> = self.readers.keys().filter(|key| **key < compaction_index).cloned().collect();
 
         for stale_log_index in stale_log_indexes {
             self.readers.remove(&stale_log_index);
@@ -208,7 +230,17 @@ impl KvStore {
             std::fs::remove_file(stale_path)?;
         }
 
+        let writer_path = self.path.to_owned().join(format!("{}.log", self.current_index));
+        let writer = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(&writer_path)?;
+
+        self.writer = BufWriter::new(writer);
+        self.readers.insert(self.current_index, BufReader::new(File::open(&writer_path)?));
         self.umcompacted_bytes = 0;
+
         Ok(())
     }
 }
