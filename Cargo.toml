@@ -1,26 +1,24 @@
 [package]
 name = "kvs"
-description = "In-memory key-value store."
-version = "0.1.0"
+description = "Key-value store."
+version = "0.2.0"
 authors = ["Bernardo Araujo <bernardo.amc@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-assert_cmd = "0.11.0"
 clap = "2.33.0"
-predicates = "1.0.0"
+failure = "0.1.5"
 structopt = "0.2"
+serde = { version = "1.0.89", features = ["derive"] }
+serde_json = "1.0.39"
+log = "0.4.6"
+env_logger = "0.6.1"
+sled = "0.22.1"
+
+[dev-dependencies]
+assert_cmd = "0.11"
+criterion = "0.2.11"
+predicates = "1.0.0"
+rand = "0.6.5"
 tempfile = "3.0.7"
 walkdir = "2.2.7"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-[lib]
-test = false
-doctest = false
-
-[[bin]]
-name = "kvs"
-path =  "src/bin/kvs.rs"
-test = false
-doctest = false
