@@ -1,11 +1,12 @@
+use super::KvsEngine;
 use crate::{KvsError, Result};
 
-use std::io::prelude::*;
-use std::io::{BufWriter, BufReader, SeekFrom};
-use std::fs::{File, OpenOptions};
 use std::collections::{BTreeMap, HashMap};
-use std::path::{PathBuf};
 use std::ffi::OsStr;
+use std::fs::{File, OpenOptions};
+use std::io::prelude::*;
+use std::io::{BufReader, BufWriter, SeekFrom};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
@@ -14,8 +15,8 @@ const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Debug)]
 enum Command {
-    Set { key: String, value: String},
-    Remove { key: String }
+    Set { key: String, value: String },
+    Remove { key: String },
 }
 
 #[derive(Debug)]
@@ -37,12 +38,6 @@ pub struct KvStore {
 
 impl KvStore {
     /// Initializes our key-value store with an empty state.
-    ///
-    /// ```
-    /// use kvs::KvStore;
-    ///
-    /// let store = KvStore::new(path, log_file, hash_map);
-    /// ```
     pub fn new(
         path: PathBuf,
         readers: HashMap<u64, BufReader<File>>,
@@ -67,9 +62,11 @@ impl KvStore {
     /// A new log file is always generated in this step to serve as the writer file.
     ///
     /// ```
-    /// use kvs::KvStore;
+    /// use crate::kvs::KvsEngine;
+    /// use self::kvs::KvStore;
+    /// use std::env::current_dir;
     ///
-    /// let store = KvStore::open(dir_path);
+    /// let store = KvStore::open(current_dir().unwrap()).unwrap();
     /// ```
     pub fn open(dir_path: impl Into<PathBuf>) -> Result<KvStore> {
         let dir_path = dir_path.into();
@@ -77,7 +74,8 @@ impl KvStore {
         let mut map: BTreeMap<String, CommandMetadata> = BTreeMap::new();
 
         let file_indexes = fetch_file_indexes(dir_path.to_owned())?;
-        let total_umcompacted_bytes = load_files(dir_path.to_owned(), &file_indexes, &mut readers, &mut map)?;
+        let total_umcompacted_bytes =
+            load_files(dir_path.to_owned(), &file_indexes, &mut readers, &mut map)?;
 
         let new_index = file_indexes.last().unwrap_or(&0) + 1;
         let writer_path = dir_path.to_owned().join(format!("{}.log", new_index));
@@ -89,12 +87,102 @@ impl KvStore {
             .open(&writer_path)?;
 
         readers.insert(new_index, BufReader::new(File::open(&writer_path)?));
-        let mut store = KvStore::new(dir_path, readers, BufWriter::new(writer), map, new_index, total_umcompacted_bytes);
+        let mut store = KvStore::new(
+            dir_path,
+            readers,
+            BufWriter::new(writer),
+            map,
+            new_index,
+            total_umcompacted_bytes,
+        );
         store.compact()?;
 
         Ok(store)
     }
 
+    /// Compacts log files once the total amount of umcompacted bytes surpasses the
+    /// COMPACTION_THRESHOLD.
+    fn compact(&mut self) -> Result<()> {
+        if self.umcompacted_bytes <= COMPACTION_THRESHOLD {
+            return Ok(());
+        }
+
+        let compaction_index = self.current_index + 1;
+        self.current_index += 2;
+
+        let compaction_path = self
+            .path
+            .to_owned()
+            .join(format!("{}.log", compaction_index));
+        let mut compaction_writer = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(&compaction_path)?;
+
+        self.readers.insert(
+            compaction_index,
+            BufReader::new(File::open(&compaction_path)?),
+        );
+
+        let mut compaction_writer_pos: u64 = 0;
+
+        for cmd_metadata in self.map.values_mut() {
+            let reader = self
+                .readers
+                .get_mut(&cmd_metadata.file_index)
+                .ok_or(KvsError::UnexpectedCommand)?;
+
+            reader.seek(SeekFrom::Start(cmd_metadata.position))?;
+            let mut chunk = reader.take(cmd_metadata.length);
+            let len = std::io::copy(&mut chunk, &mut compaction_writer)?;
+            *cmd_metadata = CommandMetadata {
+                file_index: self.current_index,
+                position: compaction_writer_pos,
+                length: len,
+            };
+            compaction_writer_pos += len;
+        }
+
+        compaction_writer.flush()?;
+        let stale_log_indexes: Vec<u64> = self
+            .readers
+            .keys()
+            .filter(|key| **key < compaction_index)
+            .cloned()
+            .collect();
+
+        for stale_log_index in stale_log_indexes {
+            self.readers.remove(&stale_log_index);
+            let stale_path = self
+                .path
+                .to_owned()
+                .join(format!("{}.log", stale_log_index));
+            std::fs::remove_file(stale_path)?;
+        }
+
+        let writer_path = self
+            .path
+            .to_owned()
+            .join(format!("{}.log", self.current_index));
+        let writer = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(&writer_path)?;
+
+        self.writer = BufWriter::new(writer);
+        self.readers.insert(
+            self.current_index,
+            BufReader::new(File::open(&writer_path)?),
+        );
+        self.umcompacted_bytes = 0;
+
+        Ok(())
+    }
+}
+
+impl KvsEngine for KvStore {
     /// Serializes a Command::Set and appends it to the writer log file.
     /// Once this operation is sucessful inserts the value and metadata to our BTreeMap.
     ///
@@ -104,19 +192,31 @@ impl KvStore {
     /// * `value` - The String value
     ///
     /// ```
-    /// use kvs::KvStore;
+    /// use crate::kvs::KvsEngine;
+    /// use self::kvs::KvStore;
+    /// use std::env::current_dir;
     ///
-    /// let mut store = KvStore::open(dir_path);
+    /// let mut store = KvStore::open(current_dir().unwrap()).unwrap();
     /// store.set("foo".to_owned(), "bar".to_owned());
     /// ```
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        let cmd = Command::Set { key: key.to_owned(), value: value.to_owned() };
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        let cmd = Command::Set {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        };
         let pos = self.writer.seek(SeekFrom::End(0))?;
         serde_json::to_writer(&mut self.writer, &cmd)?;
         self.writer.flush()?;
         let new_pos = self.writer.seek(SeekFrom::End(0))?;
 
-        let old_metadata = self.map.insert(key, CommandMetadata { file_index: self.current_index, position: pos, length: (new_pos - pos)});
+        let old_metadata = self.map.insert(
+            key,
+            CommandMetadata {
+                file_index: self.current_index,
+                position: pos,
+                length: (new_pos - pos),
+            },
+        );
 
         self.umcompacted_bytes += match old_metadata {
             Some(metadata) => metadata.length,
@@ -136,19 +236,22 @@ impl KvStore {
     /// * `key` - A String from which the associated value will be fetched
     ///
     /// ```
-    /// use kvs::KvStore;
+    /// use crate::kvs::KvsEngine;
+    /// use self::kvs::KvStore;
+    /// use std::env::current_dir;
     ///
-    /// let mut store = KvStore::open(dir_path);;
+    /// let mut store = KvStore::open(current_dir().unwrap()).unwrap();
     /// store.set("foo".to_owned(), "bar".to_owned());
     /// println!("{:?}", store.get("foo".to_owned()));
     /// ```
-    pub fn get(&mut self, key: String) -> Result<Option<String>> {
+    fn get(&mut self, key: String) -> Result<Option<String>> {
         let metadata = match self.map.get(&key) {
             Some(metadata) => metadata,
             None => return Ok(None),
         };
 
-        let mut reader = self.readers
+        let mut reader = self
+            .readers
             .get_mut(&metadata.file_index)
             .ok_or(KvsError::UnexpectedCommand)?;
 
@@ -167,80 +270,22 @@ impl KvStore {
     /// * `key` - The key to be removed from the store
     ///
     /// ```
-    /// use kvs::KvStore;
+    /// use crate::kvs::KvsEngine;
+    /// use self::kvs::KvStore;
+    /// use std::env::current_dir;
     ///
-    /// let mut store = KvStore::open(dir_path);;
+    /// let mut store = KvStore::open(current_dir().unwrap()).unwrap();
     /// store.set("foo".to_owned(), "bar".to_owned());
     /// store.remove("foo".to_owned());
     /// ```
-    pub fn remove(&mut self, key: String) -> Result<()> {
+    fn remove(&mut self, key: String) -> Result<()> {
         self.map.remove(&key).ok_or(KvsError::KeyNotFound)?;
 
-        let cmd = Command::Remove { key: key.to_owned() };
+        let cmd = Command::Remove {
+            key: key.to_owned(),
+        };
         serde_json::to_writer(&mut self.writer, &cmd)?;
-        Ok(())
-    }
-
-    /// Compacts log files once the total amount of umcompacted bytes surpasses the
-    /// COMPACTION_THRESHOLD.
-    ///
-    /// ```
-    /// use kvs::KvStore;
-    ///
-    /// let mut store = KvStore::open(dir_path);;
-    /// store.compact();
-    /// ```
-    fn compact(&mut self) -> Result<()> {
-        if self.umcompacted_bytes <= COMPACTION_THRESHOLD {
-            return Ok(())
-        }
-
-        let compaction_index = self.current_index + 1;
-        self.current_index += 2;
-
-        let compaction_path = self.path.to_owned().join(format!("{}.log", compaction_index));
-        let mut compaction_writer = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .append(true)
-            .open(&compaction_path)?;
-
-        self.readers.insert(compaction_index, BufReader::new(File::open(&compaction_path)?));
-
-        let mut compaction_writer_pos: u64 = 0;
-
-        for cmd_metadata in self.map.values_mut() {
-            let reader = self.readers
-                .get_mut(&cmd_metadata.file_index)
-                .ok_or(KvsError::UnexpectedCommand)?;
-
-            reader.seek(SeekFrom::Start(cmd_metadata.position))?;
-            let mut chunk = reader.take(cmd_metadata.length);
-            let len = std::io::copy(&mut chunk, &mut compaction_writer)?;
-            *cmd_metadata = CommandMetadata { file_index: self.current_index, position: compaction_writer_pos, length: len };
-            compaction_writer_pos += len;
-        }
-
-        compaction_writer.flush()?;
-        let stale_log_indexes: Vec<u64> = self.readers.keys().filter(|key| **key < compaction_index).cloned().collect();
-
-        for stale_log_index in stale_log_indexes {
-            self.readers.remove(&stale_log_index);
-            let stale_path = self.path.to_owned().join(format!("{}.log", stale_log_index));
-            std::fs::remove_file(stale_path)?;
-        }
-
-        let writer_path = self.path.to_owned().join(format!("{}.log", self.current_index));
-        let writer = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .append(true)
-            .open(&writer_path)?;
-
-        self.writer = BufWriter::new(writer);
-        self.readers.insert(self.current_index, BufReader::new(File::open(&writer_path)?));
-        self.umcompacted_bytes = 0;
-
+        self.writer.flush()?;
         Ok(())
     }
 }
@@ -250,8 +295,7 @@ fn fetch_file_indexes(dir_path: impl Into<PathBuf>) -> Result<Vec<u64>> {
         .flat_map(|res| -> Result<_> { Ok(res?.path()) })
         .filter(|path| path.is_file() && path.extension() == Some("log".as_ref()))
         .flat_map(|path| {
-            path
-                .file_name()
+            path.file_name()
                 .and_then(OsStr::to_str)
                 .map(|p| p.trim_end_matches(".log"))
                 .map(str::parse::<u64>)
@@ -267,7 +311,7 @@ fn load_files(
     dir_path: impl Into<PathBuf>,
     file_indexes: &Vec<u64>,
     readers: &mut HashMap<u64, BufReader<File>>,
-    map: &mut BTreeMap<String, CommandMetadata>
+    map: &mut BTreeMap<String, CommandMetadata>,
 ) -> Result<u64> {
     let dir_path = dir_path.into();
     let mut total_umcompacted_bytes: u64 = 0;
@@ -284,7 +328,11 @@ fn load_files(
     Ok(total_umcompacted_bytes)
 }
 
-fn load_file(file_index: u64, reader: &mut BufReader<File>, map: &mut BTreeMap<String, CommandMetadata>) -> Result<u64> {
+fn load_file(
+    file_index: u64,
+    reader: &mut BufReader<File>,
+    map: &mut BTreeMap<String, CommandMetadata>,
+) -> Result<u64> {
     let mut pos = reader.seek(SeekFrom::Start(0))?;
     let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
     let mut umcompacted_bytes: u64 = 0;
@@ -301,14 +349,23 @@ fn load_file(file_index: u64, reader: &mut BufReader<File>, map: &mut BTreeMap<S
 }
 
 /// Load command into our BTreeMap and return the length of superseeded commands
-fn load_command(map: &mut BTreeMap<String, CommandMetadata>, command: Command, file_index: u64, pos: u64, next_pos: u64) -> u64 {
+fn load_command(
+    map: &mut BTreeMap<String, CommandMetadata>,
+    command: Command,
+    file_index: u64,
+    pos: u64,
+    next_pos: u64,
+) -> u64 {
     let old_metadata = match command {
-        Command::Set {key, ..} => {
-            map.insert(key, CommandMetadata { file_index: file_index, position: pos, length: (next_pos - pos) })
-        },
-        Command::Remove {key} => {
-            map.remove(&key)
-        }
+        Command::Set { key, .. } => map.insert(
+            key,
+            CommandMetadata {
+                file_index: file_index,
+                position: pos,
+                length: (next_pos - pos),
+            },
+        ),
+        Command::Remove { key } => map.remove(&key),
     };
 
     match old_metadata {
